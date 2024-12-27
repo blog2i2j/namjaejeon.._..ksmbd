@@ -721,11 +721,18 @@ void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status)
 	ksmbd_free_work_struct(in_work);
 }
 
-static __le32 smb2_get_reparse_tag_special_file(umode_t mode)
+static __le32 smb2_get_reparse_tag_special_file(struct ksmbd_kstat *ksmbd_stat)
 {
-	if (S_ISDIR(mode) || S_ISREG(mode))
-		return 0;
+	umode_t mode = ksmbd_stat->kstat->mode;
 
+	if (S_ISDIR(mode) || S_ISREG(mode)) {
+	pr_err("1 ksmbd_stat->reparse_tag : %x\n", ksmbd_stat->reparse_tag);
+		if (ksmbd_stat->reparse_tag)
+			return cpu_to_le32(ksmbd_stat->reparse_tag);
+		return 0;
+	}
+
+	pr_err("2 ksmbd_stat->reparse_tag : %x\n", ksmbd_stat->reparse_tag);
 	if (S_ISLNK(mode))
 		return IO_REPARSE_TAG_LX_SYMLINK_LE;
 	else if (S_ISFIFO(mode))
@@ -747,21 +754,33 @@ static __le32 smb2_get_reparse_tag_special_file(umode_t mode)
  *
  * Return:      converted dos mode
  */
-static int smb2_get_dos_mode(struct kstat *stat, int attribute)
+static int smb2_get_dos_mode(struct ksmbd_file *fp, int attribute)
 {
 	int attr = 0;
+	umode_t mode = file_inode(fp->filp)->i_mode;
 
-	if (S_ISDIR(stat->mode)) {
+	if (S_ISDIR(mode)) {
 		attr = ATTR_DIRECTORY |
 			(attribute & (ATTR_HIDDEN | ATTR_SYSTEM));
 	} else {
+		int rc;
+
 		attr = (attribute & 0x00005137) | ATTR_ARCHIVE;
 		attr &= ~(ATTR_DIRECTORY);
-		if (S_ISREG(stat->mode) && (server_conf.share_fake_fscaps &
+		if (S_ISREG(mode) && (server_conf.share_fake_fscaps &
 				FILE_SUPPORTS_SPARSE_FILES))
 			attr |= ATTR_SPARSE;
 
-		if (smb2_get_reparse_tag_special_file(stat->mode))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+		rc = ksmbd_vfs_casexattr_len(file_mnt_idmap(fp->filp),
+#else
+		rc = ksmbd_vfs_casexattr_len(file_mnt_user_ns(fp->filp),
+#endif
+					fp->filp->f_path.dentry,
+					XATTR_NAME_RP,
+					XATTR_NAME_RP_LEN);
+		pr_err("%s:%d rc : %d\n", __func__, __LINE__, rc);
+		if (rc > 0)
 			attr |= ATTR_REPARSE;
 	}
 
@@ -2103,7 +2122,7 @@ static int smb2_create_open_flags(bool file_present, __le32 access,
 		*may_flags = MAY_OPEN | MAY_READ;
 	}
 
-	if (access == FILE_READ_ATTRIBUTES_LE || S_ISBLK(mode) || S_ISCHR(mode))
+	if (access == FILE_READ_ATTRIBUTES_LE || S_ISBLK(mode) || S_ISCHR(mode) || S_ISLNK(mode))
 		oflags |= O_PATH;
 
 	if (file_present) {
@@ -2971,6 +2990,7 @@ int smb2_open(struct ksmbd_work *work)
 		}
 
 		ksmbd_debug(SMB, "converted name = %s\n", name);
+		pr_err("converted name = %s\n", name);
 		if (strchr(name, ':')) {
 			if (!test_share_config_flag(work->tcon->share_conf,
 						    KSMBD_SHARE_FLAG_STREAMS)) {
@@ -2999,6 +3019,9 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out2;
 		}
 	}
+
+	pr_err("%s:%d, open reparse : %d\n",
+			__func__, __LINE__, req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE);
 
 	req_op_level = req->RequestedOplockLevel;
 
@@ -3205,12 +3228,6 @@ int smb2_open(struct ksmbd_work *work)
 #endif
 				goto err_out;
 			}
-		} else if (d_is_symlink(path.dentry)) {
-			rc = -EACCES;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-			path_put(&path);
-#endif
-			goto err_out;
 		}
 
 		file_present = true;
@@ -3693,7 +3710,7 @@ int smb2_open(struct ksmbd_work *work)
 		fp->create_time = ksmbd_UnixTimeToNT(stat.ctime);
 	if (req->FileAttributes || fp->f_ci->m_fattr == 0)
 		fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&stat, le32_to_cpu(req->FileAttributes)));
+			cpu_to_le32(smb2_get_dos_mode(fp, le32_to_cpu(req->FileAttributes)));
 
 	if (!created)
 		smb2_update_xattrs(tcon, &path, fp);
@@ -4067,7 +4084,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		ffdinfo = (struct file_full_directory_info *)kstat;
 		ffdinfo->FileNameLength = cpu_to_le32(conv_len);
 		ffdinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag_special_file(ksmbd_kstat);
 		if (ffdinfo->EaSize)
 			ffdinfo->ExtFileAttributes = ATTR_REPARSE_POINT_LE;
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
@@ -4083,7 +4100,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		fbdinfo = (struct file_both_directory_info *)kstat;
 		fbdinfo->FileNameLength = cpu_to_le32(conv_len);
 		fbdinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag_special_file(ksmbd_kstat);
 		if (fbdinfo->EaSize)
 			fbdinfo->ExtFileAttributes = ATTR_REPARSE_POINT_LE;
 		fbdinfo->ShortNameLength = 0;
@@ -4123,7 +4140,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		dinfo = (struct file_id_full_dir_info *)kstat;
 		dinfo->FileNameLength = cpu_to_le32(conv_len);
 		dinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag_special_file(ksmbd_kstat);
 		if (dinfo->EaSize)
 			dinfo->ExtFileAttributes = ATTR_REPARSE_POINT_LE;
 		dinfo->Reserved = 0;
@@ -4141,7 +4158,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		fibdinfo = (struct file_id_both_directory_info *)kstat;
 		fibdinfo->FileNameLength = cpu_to_le32(conv_len);
 		fibdinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag_special_file(ksmbd_kstat);
 		if (fibdinfo->EaSize)
 			fibdinfo->ExtFileAttributes = ATTR_REPARSE_POINT_LE;
 		fibdinfo->UniqueId = cpu_to_le64(ksmbd_kstat->kstat->ino);
@@ -4241,12 +4258,12 @@ static int process_query_dir_entries(struct smb2_query_dir_private *priv)
 	struct user_namespace	*user_ns = file_mnt_user_ns(priv->dir_fp->filp);
 #endif
 	struct kstat		kstat;
-	struct ksmbd_kstat	ksmbd_kstat;
 	int			rc;
 	int			i;
 
 	for (i = 0; i < priv->d_info->num_entry; i++) {
 		struct dentry *dent;
+		struct ksmbd_kstat	ksmbd_kstat = {0};
 
 		if (dentry_name(priv->d_info, priv->info_level))
 			return -EINVAL;
@@ -8564,6 +8581,37 @@ static int fsctl_request_resume_key(struct ksmbd_work *work,
 	return 0;
 }
 
+static int fsctl_fill_reparse_symlink(struct ksmbd_conn *conn,
+		struct reparse_symlink_data_buffer *reparse_sym, char *symname)
+{
+	u8 *usymname;
+	u16 symname_len;
+
+	ksmbd_debug(SMB, "symname : %s\n", symname);
+	usymname = kzalloc((strlen(symname)) * sizeof(__le16),
+			GFP_KERNEL);
+	if (!usymname)
+		return -ENOMEM;
+
+	symname_len = smbConvertToUTF16((__le16 *)usymname, symname,
+			strlen(symname), conn->local_nls, 0);
+	symname_len *= sizeof(__le16);
+	reparse_sym->PrintNameOffset = 0;
+	reparse_sym->PrintNameLength = cpu_to_le16(symname_len);
+	memcpy(reparse_sym->PathBuffer, usymname, symname_len);
+	reparse_sym->SubstituteNameOffset = cpu_to_le16(symname_len);
+	reparse_sym->SubstituteNameLength = cpu_to_le16(symname_len);
+	memcpy(&reparse_sym->PathBuffer[symname_len], usymname, symname_len);
+	if (*symname != '\\')
+		reparse_sym->Flags = cpu_to_le32(SYMLINK_FLAG_RELATIVE);
+	reparse_sym->ReparseDataLength =
+		cpu_to_le16(12 + symname_len * 2);
+	kfree(symname);
+	kfree(usymname);
+
+	return symname_len;
+}
+
 /**
  * smb2_ioctl() - handler for smb2 ioctl command
  * @work:	smb work containing ioctl command buffer
@@ -8795,10 +8843,9 @@ int smb2_ioctl(struct ksmbd_work *work)
 		break;
 	case FSCTL_GET_REPARSE_POINT:
 	{
-		struct reparse_data_buffer *reparse_ptr;
 		struct ksmbd_file *fp;
 
-		reparse_ptr = (struct reparse_data_buffer *)&rsp->Buffer[0];
+		pr_err("%s:%d FSCTL_GET_REPARSE_POINT\n", __func__, __LINE__);
 		fp = ksmbd_lookup_fd_fast(work, id);
 		if (!fp) {
 			pr_err("not found fp!!\n");
@@ -8806,11 +8853,290 @@ int smb2_ioctl(struct ksmbd_work *work)
 			goto out;
 		}
 
-		reparse_ptr->ReparseTag =
-			smb2_get_reparse_tag_special_file(file_inode(fp->filp)->i_mode);
-		reparse_ptr->ReparseDataLength = 0;
+		if (fp->f_ci->m_fattr & ATTR_REPARSE_POINT_LE) {
+			ret = -EINVAL;
+			ksmbd_fd_put(work, fp);
+			goto out;
+		}
+
+		if (S_ISLNK(file_inode(fp->filp)->i_mode)) {
+			struct reparse_symlink_data_buffer *reparse_sym =
+				(struct reparse_symlink_data_buffer *)rsp->Buffer;
+			char *symname;
+			u16 symname_len;
+
+		pr_err("%s:%d FSCTL_GET_REPARSE_POINT\n", __func__, __LINE__);
+			symname = ksmbd_vfs_get_link(fp);
+			if (IS_ERR(symname)) {
+				ksmbd_fd_put(work, fp);
+				ret = PTR_ERR(symname);
+				goto out;
+			}
+
+			symname_len = fsctl_fill_reparse_symlink(conn,
+					reparse_sym, symname);
+			if (symname_len < 0) {
+				ret = symname_len;
+				goto out;
+			}
+
+			reparse_sym->ReparseTag =
+				cpu_to_le32(IO_REPARSE_TAG_LX_SYMLINK);
+			nbytes = sizeof(struct reparse_symlink_data_buffer) +
+				symname_len * 2;
+		} else {
+			unsigned int tag, rp_data_size;
+			char *rp_data;
+
+		pr_err("%s:%d FSCTL_GET_REPARSE_POINT\n", __func__, __LINE__);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			rp_data_size = ksmbd_vfs_get_rp_xattr(conn,
+					file_mnt_idmap(fp->filp),
+					fp->filp->f_path.dentry, &tag, &rp_data);
+#else
+			rp_data_size = ksmbd_vfs_get_rp_xattr(conn,
+					file_mnt_user_ns(fp->filp),
+					fp->filp->f_path.dentry, &tag, &rp_data);
+#endif
+			if (rp_data_size < 0) {
+				ret = rp_data_size;
+				goto out;
+			}
+
+			if (tag == IO_REPARSE_TAG_LX_SYMLINK) {
+				unsigned int symname_len;
+				struct reparse_symlink_data_buffer *reparse_sym =
+					(struct reparse_symlink_data_buffer *)rsp->Buffer;
+
+		pr_err("%s:%d FSCTL_GET_REPARSE_POINT\n", __func__, __LINE__);
+				symname_len = fsctl_fill_reparse_symlink(conn,
+						reparse_sym, rp_data);
+				if (symname_len < 0) {
+					ret = symname_len;
+					goto out;
+				}
+
+				reparse_sym->ReparseTag =
+					cpu_to_le32(IO_REPARSE_TAG_SYMLINK);
+				nbytes = sizeof(struct reparse_symlink_data_buffer) +
+					symname_len * 2;
+			} else if (tag == IO_REPARSE_TAG_NFS) {
+				struct xattr_rp_nfs *rp_nfs =
+					(struct xattr_rp_nfs *)rp_data;
+				struct reparse_posix_data *buf =
+					(struct reparse_posix_data *)buffer;
+		pr_err("%s:%d FSCTL_GET_REPARSE_POINT\n", __func__, __LINE__);
+
+				buf->ReparseTag = cpu_to_le64(tag);
+				buf->InodeType = rp_nfs->inode_type;
+
+				switch (le64_to_cpu(buf->InodeType)) {
+				case NFS_SPECFILE_LNK:
+					if (rp_data_size > sizeof(__le64) + PATH_MAX) {
+						ret = -EINVAL;
+						goto out;
+					}
+					break;
+				case NFS_SPECFILE_CHR:
+				case NFS_SPECFILE_BLK:
+					if (rp_data_size != sizeof(__le64) * 2) {
+						ret = -EINVAL;
+						goto out;
+					}
+					break;
+				case NFS_SPECFILE_FIFO:
+				case NFS_SPECFILE_SOCK:
+					if (rp_data_size != sizeof(__le64)) {
+						ret = -EINVAL;
+						goto out;
+					}
+					break;
+				default:
+					ksmbd_debug(SMB, "Unhandled nfs inode type : 0x%llx\n",
+							le64_to_cpu(buf->InodeType));
+					kfree(rp_data);
+					ret = -ENOENT;
+				}
+
+				if (rp_data_size - sizeof(__le64) > 0)
+					memcpy(buf->DataBuffer, rp_nfs->rp_nfs_data,
+							rp_data_size - sizeof(__le64));
+
+				buf->ReparseDataLength = rp_data_size;
+			} else {
+				ksmbd_debug(SMB, "Unhandled tag type : 0x%x\n",
+						tag);
+				ret = -ENOENT;
+			}
+
+			kfree(rp_data);
+			if (ret < 0)
+				goto out;
+		}
+
 		ksmbd_fd_put(work, fp);
-		nbytes = sizeof(struct reparse_data_buffer);
+		break;
+	}
+	case FSCTL_SET_REPARSE_POINT:
+	{
+		struct reparse_data_buffer *reparse_ptr =
+			(struct reparse_data_buffer *)buffer;
+		struct ksmbd_file *fp;
+
+		fp = ksmbd_lookup_fd_fast(work, id);
+		if (!fp) {
+			pr_err("not found fp!!\n");
+			ret = -ENOENT;
+			goto out;
+		}
+
+		if (fp->f_ci->m_fattr & ATTR_REPARSE_POINT_LE) {
+			ret = -EINVAL;
+			ksmbd_fd_put(work, fp);
+			goto out;
+		}
+
+		if (reparse_ptr->ReparseTag ==
+		    cpu_to_le32(IO_REPARSE_TAG_SYMLINK)) {
+			struct reparse_symlink_data_buffer *sym =
+				(struct reparse_symlink_data_buffer *)buffer;
+			char *symname;
+
+		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL\n", __func__, __LINE__);
+			symname = smb_strndup_from_utf16(sym->PathBuffer +
+					le16_to_cpu(sym->SubstituteNameOffset),
+					le16_to_cpu(sym->SubstituteNameLength),
+					true,
+					conn->local_nls);
+			if (IS_ERR(symname)) {
+				ret = PTR_ERR(symname);
+				ksmbd_fd_put(work, fp);
+				goto out;
+			}
+
+			ksmbd_conv_path_to_unix(symname);
+			ksmbd_strip_last_slash(symname);
+			pr_err("create symname : %s\n", symname);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			ret = ksmbd_vfs_set_rp_xattr(conn,
+					file_mnt_idmap(fp->filp),
+					&fp->filp->f_path,
+					IO_REPARSE_TAG_SYMLINK,
+					symname, strlen(symname));
+#else
+			ret = ksmbd_vfs_set_rp_xattr(conn,
+					file_mnt_user_ns(fp->filp),
+					&fp->filp->f_path,
+					IO_REPARSE_TAG_SYMLINK,
+					symname, strlen(symname));
+#endif
+
+			kfree(symname);
+			ksmbd_fd_put(work, fp);
+			if (ret)
+				goto out;
+		} else if (reparse_ptr->ReparseTag ==
+			   cpu_to_le32(IO_REPARSE_TAG_NFS)) {
+			struct reparse_posix_data *buf =
+				(struct reparse_posix_data *)buffer;
+			u64 type;
+			struct xattr_rp_nfs *rp_nfs;
+			unsigned int rp_nfs_size;
+
+		pr_err("%s:%d FSCTL_SET_REPARSE_POINT NFS\n", __func__, __LINE__);
+			switch ((type = le64_to_cpu(buf->InodeType))) {
+		        case NFS_SPECFILE_LNK:
+			{
+				char *symname;
+				unsigned int symname_len;
+
+				// validate repasedata len
+				symname = smb_strndup_from_utf16(buf->DataBuffer,
+						le16_to_cpu(buf->ReparseDataLength),
+						true,
+						conn->local_nls);
+				if (IS_ERR(symname)) {
+					ret = PTR_ERR(symname);
+					ksmbd_fd_put(work, fp);
+					goto out;
+				}
+
+				ksmbd_conv_path_to_unix(symname);
+				ksmbd_strip_last_slash(symname);
+				pr_err("create symname : %s\n", symname);
+
+				symname_len = strlen(symname);
+				rp_nfs_size = symname_len + sizeof(__le64);
+
+				rp_nfs = kmalloc(rp_nfs_size, GFP_KERNEL);
+				if (!rp_nfs) {
+					ret = -ENOMEM;
+					ksmbd_fd_put(work, fp);
+					kfree(symname);
+					goto out;
+				}
+
+				rp_nfs->inode_type = buf->InodeType;
+				memcpy(rp_nfs->rp_nfs_data, symname,
+						symname_len);
+				kfree(symname);
+				break;
+			}
+			case NFS_SPECFILE_CHR:
+			case NFS_SPECFILE_BLK:
+			{
+				rp_nfs_size = sizeof(__le64) * 2;
+				rp_nfs = kmalloc(rp_nfs_size, GFP_KERNEL);
+				if (!rp_nfs) {
+					ret = -ENOMEM;
+					ksmbd_fd_put(work, fp);
+					goto out;
+				}
+				rp_nfs->inode_type = buf->InodeType;
+				memcpy(rp_nfs->rp_nfs_data, buf->DataBuffer,
+						sizeof(__le64));
+				break;
+			}
+			case NFS_SPECFILE_FIFO:
+			case NFS_SPECFILE_SOCK:
+				rp_nfs_size = sizeof(__le64);
+				rp_nfs = kmalloc(rp_nfs_size, GFP_KERNEL);
+				if (!rp_nfs) {
+					ret = -ENOMEM;
+					ksmbd_fd_put(work, fp);
+					goto out;
+				}
+
+				rp_nfs->inode_type = buf->InodeType;
+				break;
+			default:
+				ksmbd_debug(SMB, "Unhandled info type : 0x%llx\n",
+						type);
+				ksmbd_fd_put(work, fp);
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			ret = ksmbd_vfs_set_rp_xattr(conn,
+					file_mnt_idmap(fp->filp),
+					&fp->filp->f_path,
+					IO_REPARSE_TAG_NFS,
+					(char *)rp_nfs, rp_nfs_size);
+#else
+			ret = ksmbd_vfs_set_rp_xattr(conn,
+					file_mnt_user_ns(fp->filp),
+					&fp->filp->f_path,
+					IO_REPARSE_TAG_NFS,
+					(char *)rp_nfs, rp_nfs_size);
+#endif
+			ksmbd_fd_put(work, fp);
+		} else {
+			ksmbd_fd_put(work, fp);
+			ret = -ENOENT;
+			goto out;
+		}
+
 		break;
 	}
 	case FSCTL_DUPLICATE_EXTENTS_TO_FILE:
