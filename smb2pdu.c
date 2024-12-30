@@ -137,6 +137,49 @@ int smb2_get_ksmbd_tcon(struct ksmbd_work *work)
 	return 1;
 }
 
+static int smb2_set_symlink_err_rsp(struct ksmbd_work *work, char *symname)
+{
+	struct smb2_err_rsp *err_rsp;
+	struct smb2_symlink_err_rsp *sym_err_rsp;
+	u8 *usymname;
+	u16 symname_len;
+
+	usymname = kzalloc((strlen(symname)) * sizeof(__le16),
+			GFP_KERNEL);
+	if (!usymname)
+		return -ENOMEM;
+	symname_len *= sizeof(__le16);
+
+	if (work->next_smb2_rcv_hdr_off)
+		err_rsp = ksmbd_resp_buf_next(work);
+	else
+		err_rsp = smb2_get_msg(work->response_buf);
+
+	sym_err_rsp = (struct smb2_symlink_err_rsp *)err_rsp->ErrorData;
+
+	sym_err_rsp->PrintNameOffset = 0;
+	sym_err_rsp->PrintNameLength = cpu_to_le16(symname_len);
+	memcpy(sym_err_rsp->PathBuffer, usymname, symname_len);
+	sym_err_rsp->SubstituteNameOffset = cpu_to_le16(symname_len);
+	sym_err_rsp->SubstituteNameLength = cpu_to_le16(symname_len);
+	memcpy(&sym_err_rsp->PathBuffer[symname_len], usymname, symname_len);
+	if (*symname != '\\')
+		sym_err_rsp->Flags = cpu_to_le32(SYMLINK_FLAG_RELATIVE);
+
+	sym_err_rsp->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+	sym_err_rsp->ReparseDataLength = cpu_to_le16(12 + symname_len * 2);
+	sym_err_rsp->UnparsedPathLength = 0;
+	err_rsp->ByteCount =
+		cpu_to_le32(sizeof(struct smb2_symlink_err_rsp) +
+				symname_len * 2);
+	sym_err_rsp->SymLinkLength =
+		cpu_to_le32((sizeof(struct smb2_symlink_err_rsp) - sizeof(__le32)) +
+				symname_len * 2);
+	kfree(usymname);
+
+	return 0;
+}
+
 /**
  * smb2_set_err_rsp() - set error response code on smb response
  * @work:	smb work containing response buffer
@@ -150,13 +193,20 @@ void smb2_set_err_rsp(struct ksmbd_work *work)
 	else
 		err_rsp = smb2_get_msg(work->response_buf);
 
-	if (err_rsp->hdr.Status != STATUS_STOPPED_ON_SYMLINK) {
+	err_rsp->StructureSize = SMB2_ERROR_STRUCTURE_SIZE2_LE;
+	err_rsp->ErrorContextCount = 0;
+	err_rsp->Reserved = 0;
+	err_rsp->ByteCount = 0;
+
+	if (err_rsp->hdr.Status == STATUS_STOPPED_ON_SYMLINK) {
+		struct smb2_symlink_err_rsp * sym_err_rsp =
+			(struct smb2_symlink_err_rsp *)err_rsp->ErrorData;
+
+		ksmbd_iov_pin_rsp(work, (void *)err_rsp, SMB2_SYMLINK_STRUCT_SIZE +
+				  le32_to_cpu(sym_err_rsp->SubstituteNameLength) * 2);
+	} else {
 		int err;
 
-		err_rsp->StructureSize = SMB2_ERROR_STRUCTURE_SIZE2_LE;
-		err_rsp->ErrorContextCount = 0;
-		err_rsp->Reserved = 0;
-		err_rsp->ByteCount = 0;
 		err_rsp->ErrorData[0] = 0;
 		err = ksmbd_iov_pin_rsp(work, (void *)err_rsp,
 					__SMB2_HEADER_STRUCTURE_SIZE +
@@ -780,8 +830,10 @@ static int smb2_get_dos_mode(struct ksmbd_file *fp, int attribute)
 					XATTR_NAME_RP,
 					XATTR_NAME_RP_LEN);
 		pr_err("%s:%d rc : %d\n", __func__, __LINE__, rc);
-		if (rc > 0)
+		if (rc > 0) {
+			pr_err("set ATTR REPARSE!!!!!!!!!!!!\n");
 			attr |= ATTR_REPARSE;
+		}
 	}
 
 	return attr;
@@ -2963,6 +3015,8 @@ int smb2_open(struct ksmbd_work *work)
 	umode_t posix_mode = 0;
 	__le32 daccess, maximal_access = 0;
 	int iov_len = 0;
+	char *symname;
+	unsigned int tag;
 
 	WORK_BUFFERS(work, req, rsp);
 
@@ -3447,6 +3501,18 @@ int smb2_open(struct ksmbd_work *work)
 
 	ksmbd_vfs_set_fadvise(filp, req->CreateOptions);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	rc = ksmbd_vfs_get_rp_xattr(work->conn, idmap, path.dentry,
+			&tag, &symname);
+#else
+	rc = ksmbd_vfs_get_rp_xattr(work->conn, user_ns, path.dentry,
+			&tag, &symname);
+#endif
+	if (rc > 0 && tag == IO_REPARSE_TAG_SYMLINK) {
+		rc = -ELOOP;
+		goto err_out;
+	}
+
 	/* Obtain Volatile-ID */
 	fp = ksmbd_open_fd(work, filp);
 	if (IS_ERR(fp)) {
@@ -3912,6 +3978,11 @@ err_out2:
 			rsp->hdr.Status = STATUS_OBJECT_NAME_COLLISION;
 		else if (rc == -EMFILE)
 			rsp->hdr.Status = STATUS_INSUFFICIENT_RESOURCES;
+		else if (rc == -ELOOP) {
+			smb2_set_symlink_err_rsp(work, symname);
+			kfree(symname);
+			rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
+		}
 		if (!rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
 
@@ -4551,6 +4622,7 @@ int smb2_query_dir(struct ksmbd_work *work)
 
 	WORK_BUFFERS(work, req, rsp);
 
+	pr_err("%s:%d\n", __func__, __LINE__);
 	if (ksmbd_override_fsids(work)) {
 		rsp->hdr.Status = STATUS_NO_MEMORY;
 		smb2_set_err_rsp(work);
@@ -8983,6 +9055,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 			(struct reparse_data_buffer *)buffer;
 		struct ksmbd_file *fp;
 
+		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL\n", __func__, __LINE__);
 		fp = ksmbd_lookup_fd_fast(work, id);
 		if (!fp) {
 			pr_err("not found fp!!\n");
@@ -8990,12 +9063,14 @@ int smb2_ioctl(struct ksmbd_work *work)
 			goto out;
 		}
 
+		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL\n", __func__, __LINE__);
 		if (fp->f_ci->m_fattr & ATTR_REPARSE_POINT_LE) {
 			ret = -EINVAL;
 			ksmbd_fd_put(work, fp);
 			goto out;
 		}
 
+		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL, reparse_ptr->ReparseTag : %x\n", __func__, __LINE__, reparse_ptr->ReparseTag);
 		if (reparse_ptr->ReparseTag ==
 		    cpu_to_le32(IO_REPARSE_TAG_SYMLINK)) {
 			struct reparse_symlink_data_buffer *sym =
