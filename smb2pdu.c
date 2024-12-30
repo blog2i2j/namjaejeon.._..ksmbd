@@ -144,6 +144,7 @@ static int smb2_set_symlink_err_rsp(struct ksmbd_work *work, char *symname)
 	u8 *usymname;
 	u16 symname_len;
 
+	pr_err("%s:%d, symname : %s\n", __func__, __LINE__, symname);
 	usymname = kzalloc((strlen(symname)) * sizeof(__le16),
 			GFP_KERNEL);
 	if (!usymname)
@@ -166,7 +167,8 @@ static int smb2_set_symlink_err_rsp(struct ksmbd_work *work, char *symname)
 	if (*symname != '\\')
 		sym_err_rsp->Flags = cpu_to_le32(SYMLINK_FLAG_RELATIVE);
 
-	sym_err_rsp->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+	sym_err_rsp->SymLinkErrorTag = cpu_to_le32(SYMLINK_ERROR_TAG);
+	sym_err_rsp->ReparseTag = cpu_to_le32(IO_REPARSE_TAG_SYMLINK);
 	sym_err_rsp->ReparseDataLength = cpu_to_le16(12 + symname_len * 2);
 	sym_err_rsp->UnparsedPathLength = 0;
 	err_rsp->ByteCount =
@@ -196,7 +198,6 @@ void smb2_set_err_rsp(struct ksmbd_work *work)
 	err_rsp->StructureSize = SMB2_ERROR_STRUCTURE_SIZE2_LE;
 	err_rsp->ErrorContextCount = 0;
 	err_rsp->Reserved = 0;
-	err_rsp->ByteCount = 0;
 
 	if (err_rsp->hdr.Status == STATUS_STOPPED_ON_SYMLINK) {
 		struct smb2_symlink_err_rsp * sym_err_rsp =
@@ -207,6 +208,7 @@ void smb2_set_err_rsp(struct ksmbd_work *work)
 	} else {
 		int err;
 
+		err_rsp->ByteCount = 0;
 		err_rsp->ErrorData[0] = 0;
 		err = ksmbd_iov_pin_rsp(work, (void *)err_rsp,
 					__SMB2_HEADER_STRUCTURE_SIZE +
