@@ -3800,7 +3800,8 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	if (!(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE)) {
+	if (file_present && !(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE)) {
+		pr_err("%s:%d\n", __func__, __LINE__);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 		rc = ksmbd_vfs_get_rp_xattr(work->conn, idmap, fp->filp->f_path.dentry,
 				&tag, &symname);
@@ -3808,8 +3809,17 @@ int smb2_open(struct ksmbd_work *work)
 		rc = ksmbd_vfs_get_rp_xattr(work->conn, user_ns, fp->filp->f_path.dentry,
 				&tag, &symname);
 #endif
+		pr_err("%s:%d\n", __func__, __LINE__);
 		if (rc > 0 && tag == IO_REPARSE_TAG_SYMLINK) {
-			rc = -ELOOP;
+			smb2_set_symlink_err_rsp(work, symname);
+			kfree(symname);
+			rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
+			rc = 0;
+			smb2_set_err_rsp(work);
+
+			work->compound_fid = fp->volatile_id;
+			work->compound_pfid = fp->persistent_id;
+			work->compound_sid = le64_to_cpu(work->sess->id);
 			goto err_out1;
 		}
 		rc = 0;
@@ -6144,6 +6154,7 @@ int smb2_close(struct ksmbd_work *work)
 		rsp->hdr.Status = STATUS_USER_SESSION_DELETED;
 		if (req->hdr.Flags & SMB2_FLAGS_RELATED_OPERATIONS)
 			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+		pr_err("%s:%d\n", __func__, __LINE__);
 		err = -EBADF;
 		goto out;
 	}
@@ -6152,7 +6163,7 @@ int smb2_close(struct ksmbd_work *work)
 	    !has_file_id(req->VolatileFileId)) {
 		if (!has_file_id(work->compound_fid)) {
 			/* file already closed, return FILE_CLOSED */
-			ksmbd_debug(SMB, "file already closed\n");
+			pr_err("file already closed\n");
 			rsp->hdr.Status = STATUS_FILE_CLOSED;
 			err = -EBADF;
 			goto out;
