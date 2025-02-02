@@ -9092,6 +9092,8 @@ int smb2_ioctl(struct ksmbd_work *work)
 		struct reparse_data_buffer *reparse_ptr =
 			(struct reparse_data_buffer *)buffer;
 		struct ksmbd_file *fp;
+		int id = 1000;
+		int mode = 0644;
 
 		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL\n", __func__, __LINE__);
 		fp = ksmbd_lookup_fd_fast(work, id);
@@ -9145,6 +9147,37 @@ int smb2_ioctl(struct ksmbd_work *work)
 #endif
 
 			kfree(symname);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			ret = ksmbd_vfs_setxattr(file_mnt_idmap(fp->filp), &fp->filp->f_path,
+#else
+			ret = ksmbd_vfs_setxattr(user_ns, path,
+#endif
+					XATTR_NAME_WSL_UID, &id,
+					sizeof(int), 0, true);
+			if (ret < 0)
+				pr_err("Failed to store XATTR reparse point : %d\n", ret);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			ret = ksmbd_vfs_setxattr(file_mnt_idmap(fp->filp), &fp->filp->f_path,
+#else
+			ret = ksmbd_vfs_setxattr(user_ns, path,
+#endif
+					XATTR_NAME_WSL_GID, &id,
+					sizeof(int), 0, true);
+			if (ret < 0)
+				pr_err("Failed to store XATTR reparse point : %d\n", ret);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			ret = ksmbd_vfs_setxattr(file_mnt_idmap(fp->filp), &fp->filp->f_path,
+#else
+			ret = ksmbd_vfs_setxattr(user_ns, path,
+#endif
+					XATTR_NAME_WSL_MODE, &mode,
+					sizeof(int), 0, true);
+			if (ret < 0)
+				pr_err("Failed to store XATTR reparse point : %d\n", ret);
+
 			ksmbd_fd_put(work, fp);
 			if (ret)
 				goto out;
