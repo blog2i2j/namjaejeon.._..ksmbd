@@ -825,8 +825,10 @@ static int smb2_get_dos_mode(struct ksmbd_file *fp, int attribute)
 		attr = (attribute & 0x00005137) | ATTR_ARCHIVE;
 		attr &= ~(ATTR_DIRECTORY);
 		if (S_ISREG(mode) && (server_conf.share_fake_fscaps &
-				FILE_SUPPORTS_SPARSE_FILES))
+				FILE_SUPPORTS_SPARSE_FILES)) {
+			pr_err("set ATTR SPARSE!!!!!!!!!!!!\n");
 			attr |= ATTR_SPARSE;
+		}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 		rc = ksmbd_vfs_casexattr_len(file_mnt_idmap(fp->filp),
@@ -2682,6 +2684,8 @@ static void smb2_update_xattrs(struct ksmbd_tree_connect *tcon,
 
 	fp->f_ci->m_fattr &= ~(ATTR_HIDDEN_LE | ATTR_SYSTEM_LE);
 
+	return;
+
 	/* get FileAttributes from XATTR_NAME_DOS_ATTRIBUTE */
 	if (!test_share_config_flag(tcon->share_conf,
 				    KSMBD_SHARE_FLAG_STORE_DOS_ATTRS))
@@ -2689,6 +2693,7 @@ static void smb2_update_xattrs(struct ksmbd_tree_connect *tcon,
 
 	rc = compat_ksmbd_vfs_get_dos_attrib_xattr(path, path->dentry, &da);
 	if (rc > 0) {
+	pr_err("%s:%d\n", __func__, __LINE__);
 		fp->f_ci->m_fattr = cpu_to_le32(da.attr);
 		fp->create_time = da.create_time;
 		fp->itime = da.itime;
@@ -3769,14 +3774,20 @@ int smb2_open(struct ksmbd_work *work)
 		fp->create_time = ksmbd_UnixTimeToNT(stat.btime);
 	else
 		fp->create_time = ksmbd_UnixTimeToNT(stat.ctime);
-	if (req->FileAttributes || fp->f_ci->m_fattr == 0)
+	if (req->FileAttributes || fp->f_ci->m_fattr == 0) {
+	pr_err("%s:%d\n", __func__, __LINE__);
 		fp->f_ci->m_fattr =
 			cpu_to_le32(smb2_get_dos_mode(fp, le32_to_cpu(req->FileAttributes)));
+	}
 
+	if (fp->f_ci->m_fattr & ATTR_REPARSE_POINT_LE)
+		pr_err("## set REPARSE POINT!!!!!!!!!!\n");
 	if (!created)
 		smb2_update_xattrs(tcon, &path, fp);
 	else
 		smb2_new_xattrs(tcon, &path, fp);
+	if (fp->f_ci->m_fattr & ATTR_REPARSE_POINT_LE)
+		pr_err("$$ set REPARSE POINT!!!!!!!!!!\n");
 
 	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
 
@@ -3801,7 +3812,6 @@ int smb2_open(struct ksmbd_work *work)
 	}
 
 	if (file_present && !(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE)) {
-		pr_err("%s:%d\n", __func__, __LINE__);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 		rc = ksmbd_vfs_get_rp_xattr(work->conn, idmap, fp->filp->f_path.dentry,
 				&tag, &symname);
@@ -3809,7 +3819,6 @@ int smb2_open(struct ksmbd_work *work)
 		rc = ksmbd_vfs_get_rp_xattr(work->conn, user_ns, fp->filp->f_path.dentry,
 				&tag, &symname);
 #endif
-		pr_err("%s:%d\n", __func__, __LINE__);
 		if (rc > 0 && tag == IO_REPARSE_TAG_SYMLINK) {
 			smb2_set_symlink_err_rsp(work, symname);
 			kfree(symname);
@@ -3844,6 +3853,9 @@ reconnected_fp:
 		cpu_to_le64(stat.blocks << 9);
 	rsp->EndofFile = S_ISDIR(stat.mode) ? 0 : cpu_to_le64(stat.size);
 	rsp->FileAttributes = fp->f_ci->m_fattr;
+
+	if (rsp->FileAttributes & ATTR_REPARSE_POINT_LE)
+		pr_err("2 set REPARSE POINT!!!!!!!!!!\n");
 
 	rsp->Reserved2 = 0;
 
@@ -3971,6 +3983,7 @@ err_out:
 err_out1:
 	ksmbd_revert_fsids(work);
 err_out2:
+	pr_err("%s:%d, rc : %d\n", __func__, __LINE__, rc);
 	if (!rc) {
 		ksmbd_update_fstate(&work->sess->file_table, fp, FP_INITED);
 		rc = ksmbd_iov_pin_rsp(work, (void *)rsp, iov_len);
@@ -5091,8 +5104,10 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	prev_eainfo->NextEntryOffset = 0;
 done:
 	rc = 0;
-	if (rsp_data_cnt == 0)
+	if (rsp_data_cnt == 0) {
 		rsp->hdr.Status = STATUS_NO_EAS_ON_FILE;
+		rc = -EINVAL;
+	}
 	rsp->OutputBufferLength = cpu_to_le32(rsp_data_cnt);
 out:
 	kvfree(xattr_list);
@@ -5211,7 +5226,7 @@ static int get_file_all_info(struct ksmbd_work *work,
 	if (ret)
 		return ret;
 
-	ksmbd_debug(SMB, "filename = %s\n", filename);
+	pr_err("filename = %s\n", filename);
 	delete_pending = ksmbd_inode_pending_delete(fp);
 	file_info = (struct smb2_file_all_info *)rsp->Buffer;
 
@@ -6040,6 +6055,7 @@ int smb2_query_info(struct ksmbd_work *work)
 	case SMB2_O_INFO_FILE:
 		ksmbd_debug(SMB, "GOT SMB2_O_INFO_FILE\n");
 		rc = smb2_get_info_file(work, req, rsp);
+			pr_err("%s:%d, rc : %d\n", __func__, __LINE__, rc);
 		break;
 	case SMB2_O_INFO_FILESYSTEM:
 		ksmbd_debug(SMB, "GOT SMB2_O_INFO_FILESYSTEM\n");
@@ -6050,7 +6066,7 @@ int smb2_query_info(struct ksmbd_work *work)
 		rc = smb2_get_info_sec(work, req, rsp);
 		break;
 	default:
-		ksmbd_debug(SMB, "InfoType %d not supported yet\n",
+		pr_err("InfoType %d not supported yet\n",
 			    req->InfoType);
 		rc = -EOPNOTSUPP;
 	}
@@ -6062,9 +6078,11 @@ int smb2_query_info(struct ksmbd_work *work)
 		rc = ksmbd_iov_pin_rsp(work, (void *)rsp,
 				       offsetof(struct smb2_query_info_rsp, Buffer) +
 					le32_to_cpu(rsp->OutputBufferLength));
+			pr_err("%s:%d, rc : %d\n", __func__, __LINE__, rc);
 	}
 
 err_out:
+	pr_err("%s:%d, rc : %d\n", __func__, __LINE__, rc);
 	if (rc < 0) {
 		if (rc == -EACCES)
 			rsp->hdr.Status = STATUS_ACCESS_DENIED;
@@ -9092,7 +9110,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 		struct reparse_data_buffer *reparse_ptr =
 			(struct reparse_data_buffer *)buffer;
 		struct ksmbd_file *fp;
-		int id = 1000;
+		int sid = 1000;
 		int mode = 0644;
 
 		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL\n", __func__, __LINE__);
@@ -9153,7 +9171,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 #else
 			ret = ksmbd_vfs_setxattr(user_ns, path,
 #endif
-					XATTR_NAME_WSL_UID, &id,
+					XATTR_NAME_WSL_UID, &sid,
 					sizeof(int), 0, true);
 			if (ret < 0)
 				pr_err("Failed to store XATTR reparse point : %d\n", ret);
@@ -9163,7 +9181,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 #else
 			ret = ksmbd_vfs_setxattr(user_ns, path,
 #endif
-					XATTR_NAME_WSL_GID, &id,
+					XATTR_NAME_WSL_GID, &sid,
 					sizeof(int), 0, true);
 			if (ret < 0)
 				pr_err("Failed to store XATTR reparse point : %d\n", ret);
