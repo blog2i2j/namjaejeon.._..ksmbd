@@ -4967,14 +4967,15 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	/* single EA entry is requested with given user.* name */
 	if (req->InputBufferLength) {
 		if (le32_to_cpu(req->InputBufferLength) <
-		    sizeof(struct smb2_ea_info_req)) {
-			pr_err("%s:%d\n", __func__, __LINE__);
+		    sizeof(struct smb2_ea_info_req))
 			return -EINVAL;
-		}
 
 		ea_req = (struct smb2_ea_info_req *)((char *)req +
 						     le16_to_cpu(req->InputBufferOffset));
-		input_buf_len = le32_to_cpu(req->InputBufferLength);
+
+		if (le32_to_cpu(req->InputBufferLength) <
+		    sizeof(struct smb2_ea_info_req) + ea_req->EaNameLength)
+			return -EINVAL;
 	} else {
 		/* need to send all EAs, if no specific EA is requested*/
 		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY)
@@ -5028,14 +5029,31 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 
 		if (req->InputBufferLength) {
 			bool found = false;
+			unsigned int input_buf_len = le32_to_cpu(req->InputBufferLength);
+			unsigned int next;
 
+			ea_req = (struct smb2_ea_info_req *)((char *)req +
+						     le16_to_cpu(req->InputBufferOffset));
 			do {
+				pr_err("ea_req name : %s\n", ea_req->name);
 				if (!strncmp(&name[XATTR_USER_PREFIX_LEN], ea_req->name,
-					     ea_req->EaNameLength)) {
+				    ea_req->EaNameLength)) {
 					found = true;
 					break;
 				}
-			} while ();
+
+				next = le32_to_cpu(ea_req->NextEntryOffset);
+				if (next == 0 || input_buf_len < next)
+					break;
+				input_buf_len -= next;
+				ea_req = (struct smb2_ea_info_req *)((char *)ea_req + next);
+				if (input_buf_len < sizeof(struct smb2_ea_info_req))
+					break;
+
+				if (input_buf_len <
+				    sizeof(struct smb2_ea_info_req) + ea_req->EaNameLength)
+					break;
+			} while (input_buf_len > 0);
 
 			if (found == false)
 				continue;
@@ -5105,8 +5123,8 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		eainfo = (struct smb2_ea_info *)ptr;
 		rsp_data_cnt += next_offset;
 
-		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY)) {
-			pr_err("single entry requested\n");
+		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY) {
+			ksmbd_debug(SMB, "single entry requested\n");
 			break;
 		}
 	}
