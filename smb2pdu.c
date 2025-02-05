@@ -4974,6 +4974,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 
 		ea_req = (struct smb2_ea_info_req *)((char *)req +
 						     le16_to_cpu(req->InputBufferOffset));
+		input_buf_len = le32_to_cpu(req->InputBufferLength);
 	} else {
 		/* need to send all EAs, if no specific EA is requested*/
 		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY)
@@ -5025,10 +5026,20 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 			     STREAM_PREFIX_LEN))
 			continue;
 
-		if (req->InputBufferLength &&
-		    strncmp(&name[XATTR_USER_PREFIX_LEN], ea_req->name,
-			    ea_req->EaNameLength))
-			continue;
+		if (req->InputBufferLength) {
+			bool found = false;
+
+			do {
+				if (!strncmp(&name[XATTR_USER_PREFIX_LEN], ea_req->name,
+					     ea_req->EaNameLength)) {
+					found = true;
+					break;
+				}
+			} while ();
+
+			if (found == false)
+				continue;
+		}
 
 		if (!strncmp(&name[XATTR_USER_PREFIX_LEN],
 			     DOS_ATTRIBUTE_PREFIX, DOS_ATTRIBUTE_PREFIX_LEN))
@@ -5094,7 +5105,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		eainfo = (struct smb2_ea_info *)ptr;
 		rsp_data_cnt += next_offset;
 
-		if (req->InputBufferLength) {
+		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY)) {
 			pr_err("single entry requested\n");
 			break;
 		}
