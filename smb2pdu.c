@@ -5107,8 +5107,8 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 
 		eainfo->name[name_len] = '\0';
 		eainfo->EaValueLength = cpu_to_le16(value_len);
-		next_offset = offsetof(struct smb2_ea_info, name) +
-			name_len + 1 + value_len;
+		next_offset = ALIGN(offsetof(struct smb2_ea_info, name) +
+			name_len + 1 + value_len, 4);
 
 		/* align next xattr entry at 4 byte bundary */
 		alignment_bytes = ((next_offset + 3) & ~3) - next_offset;
@@ -9221,6 +9221,16 @@ int smb2_ioctl(struct ksmbd_work *work)
 			ret = ksmbd_vfs_setxattr(user_ns, path,
 #endif
 					XATTR_NAME_WSL_MODE, &mode,
+					sizeof(int), 0, true);
+			if (ret < 0)
+				pr_err("Failed to store XATTR reparse point : %d\n", ret);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+			ret = ksmbd_vfs_setxattr(file_mnt_idmap(fp->filp), &fp->filp->f_path,
+#else
+			ret = ksmbd_vfs_setxattr(user_ns, path,
+#endif
+					XATTR_NAME_WSL_DEV, &sid,
 					sizeof(int), 0, true);
 			if (ret < 0)
 				pr_err("Failed to store XATTR reparse point : %d\n", ret);
