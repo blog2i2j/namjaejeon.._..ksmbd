@@ -3056,7 +3056,7 @@ int smb2_open(struct ksmbd_work *work)
 		}
 
 		ksmbd_debug(SMB, "converted name = %s\n", name);
-		pr_err("converted name = %s\n", name);
+		pr_err("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ converted name = %s\n", name);
 		if (strchr(name, ':')) {
 			if (!test_share_config_flag(work->tcon->share_conf,
 						    KSMBD_SHARE_FLAG_STREAMS)) {
@@ -4931,6 +4931,121 @@ static int smb2_get_info_file_pipe(struct ksmbd_session *sess,
 	return rc;
 }
 
+static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
+		int xattr_list_len, char *ptr, ssize_t *rsp_data_cnt,
+		ssize_t *buf_free_len, u8 *ea_name, unsigned int ea_name_len,
+		unsigned int req_flags)
+{
+	struct smb2_ea_info *eainfo, *prev_eainfo;
+	char *name, *xattr_list = NULL, *buf;
+	int rc, name_len, value_len, idx = 0;
+	ssize_t alignment_bytes, next_offset = 0;
+
+	eainfo = (struct smb2_ea_info *)ptr;
+	prev_eainfo = eainfo;
+
+	while (idx < xattr_list_len) {
+		name = xattr_list + idx;
+		name_len = strlen(name);
+
+		pr_err("%s, len %d\n", name, name_len);
+		idx += name_len + 1;
+
+		/*
+		 * CIFS does not support EA other than user.* namespace,
+		 * still keep the framework generic, to list other attrs
+		 * in future.
+		 */
+		if (strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
+			continue;
+
+		if (!strncmp(&name[XATTR_USER_PREFIX_LEN], STREAM_PREFIX,
+			     STREAM_PREFIX_LEN))
+			continue;
+
+		if (ea_name_len) {
+			pr_err("ea_req name : %s\n", ea_req->name);
+			if (strncmp(&name[XATTR_USER_PREFIX_LEN], ea_name,
+				     ea_name_len))
+				continue;
+		}
+
+		if (!strncmp(&name[XATTR_USER_PREFIX_LEN],
+			     DOS_ATTRIBUTE_PREFIX, DOS_ATTRIBUTE_PREFIX_LEN))
+			continue;
+
+		if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
+			name_len -= XATTR_USER_PREFIX_LEN;
+		
+		pr_err("2 %s, len %d\n", name, name_len);
+
+		ptr = eainfo->name + name_len + 1;
+		buf_free_len -= (offsetof(struct smb2_ea_info, name) +
+				name_len + 1);
+		/* bailout if xattr can't fit in buf_free_len */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+		value_len = ksmbd_vfs_getxattr(idmap, path->dentry,
+#else
+		value_len = ksmbd_vfs_getxattr(user_ns, path->dentry,
+#endif
+					       name, &buf);
+		if (value_len < 0) {
+			rc = -ENOENT;
+		pr_err("%s:%d\n", __func__, __LINE__);
+			rsp->hdr.Status = STATUS_INVALID_HANDLE;
+			goto out;
+		}
+
+		if (value_len > 0) {
+			buf_free_len -= value_len;
+			if (buf_free_len < 0) {
+				kfree(buf);
+				pr_err("%s:%d\n", __func__, __LINE__);
+				break;
+			}
+
+			memcpy(ptr, buf, value_len);
+		}
+		kfree(buf);
+
+		ptr += value_len;
+		eainfo->Flags = 0;
+		eainfo->EaNameLength = name_len;
+
+		if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
+			memcpy(eainfo->name, &name[XATTR_USER_PREFIX_LEN],
+			       name_len);
+		else
+			memcpy(eainfo->name, name, name_len);
+
+		eainfo->name[name_len] = '\0';
+		eainfo->EaValueLength = cpu_to_le16(value_len);
+		next_offset = offsetof(struct smb2_ea_info, name) +
+			name_len + 1 + value_len;
+
+		/* align next xattr entry at 4 byte bundary */
+		alignment_bytes = ((next_offset + 3) & ~3) - next_offset;
+		if (alignment_bytes) {
+			memset(ptr, '\0', alignment_bytes);
+			next_offset += alignment_bytes;
+			buf_free_len -= alignment_bytes;
+		}
+
+		eainfo->NextEntryOffset = cpu_to_le32(next_offset);
+		prev_eainfo = eainfo;
+		eainfo = (struct smb2_ea_info *)((char *)eainfo + next_offset);
+		rsp_data_cnt += next_offset;
+
+		if (req_flags & SL_RETURN_SINGLE_ENTRY) {
+			ksmbd_debug(SMB, "single entry requested\n");
+			break;
+		}
+	}
+
+out:
+	return rc;
+}
+
 /**
  * smb2_get_ea() - handler for smb2 get extended attribute command
  * @work:	smb work containing query info command buffer
@@ -5004,133 +5119,58 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	xattr_list_len = rc;
 
 	ptr = (char *)rsp->Buffer;
-	eainfo = (struct smb2_ea_info *)ptr;
-	prev_eainfo = eainfo;
-	idx = 0;
 
-	while (idx < xattr_list_len) {
-		name = xattr_list + idx;
-		name_len = strlen(name);
+	if (req->InputBufferLength) {
+		bool found = false;
+		unsigned int input_buf_len = le32_to_cpu(req->InputBufferLength);
+		unsigned int next;
 
-		pr_err("%s, len %d\n", name, name_len);
-		idx += name_len + 1;
+		ea_req = (struct smb2_ea_info_req *)((char *)req +
+				le16_to_cpu(req->InputBufferOffset));
+		do {
+			if (input_buf_len < sizeof(struct smb2_ea_info_req))
+				break;
 
-		/*
-		 * CIFS does not support EA other than user.* namespace,
-		 * still keep the framework generic, to list other attrs
-		 * in future.
-		 */
-		if (strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
-			continue;
+			if (input_buf_len <
+			    sizeof(struct smb2_ea_info_req) + ea_req->EaNameLength)
+				break;
 
-		if (!strncmp(&name[XATTR_USER_PREFIX_LEN], STREAM_PREFIX,
-			     STREAM_PREFIX_LEN))
-			continue;
+			pr_err("ea_req name : %s\n", ea_req->name);
+			next_offset = smb2_fill_ea_rsp(idmap, xattr_list,
+					xattr_list_len, ptr + rsp_data_cnt,
+					&rsp_data_cnt, &buf_free_len,
+					ea_req->name, ea_req->EaNameLength, 0);
+			if (next_offset < 0)
+				goto out;
 
-		if (req->InputBufferLength) {
-			bool found = false;
-			unsigned int input_buf_len = le32_to_cpu(req->InputBufferLength);
-			unsigned int next;
+			next = le32_to_cpu(ea_req->NextEntryOffset);
+			if (next == 0 || input_buf_len < next)
+				break;
+			input_buf_len -= next;
+			ea_req = (struct smb2_ea_info_req *)((char *)ea_req + next);
 
-			ea_req = (struct smb2_ea_info_req *)((char *)req +
-						     le16_to_cpu(req->InputBufferOffset));
-			do {
-				pr_err("ea_req name : %s\n", ea_req->name);
-				if (!strncmp(&name[XATTR_USER_PREFIX_LEN], ea_req->name,
-				    ea_req->EaNameLength)) {
-					found = true;
-					break;
-				}
+			if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY) {
+				ksmbd_debug(SMB, "single entry requested\n");
+				break;
+			}
+		} while (input_buf_len > 0);
 
-				next = le32_to_cpu(ea_req->NextEntryOffset);
-				if (next == 0 || input_buf_len < next)
-					break;
-				input_buf_len -= next;
-				ea_req = (struct smb2_ea_info_req *)((char *)ea_req + next);
-				if (input_buf_len < sizeof(struct smb2_ea_info_req))
-					break;
-
-				if (input_buf_len <
-				    sizeof(struct smb2_ea_info_req) + ea_req->EaNameLength)
-					break;
-			} while (input_buf_len > 0);
-
-			if (found == false)
-				continue;
-		}
-
-		if (!strncmp(&name[XATTR_USER_PREFIX_LEN],
-			     DOS_ATTRIBUTE_PREFIX, DOS_ATTRIBUTE_PREFIX_LEN))
-			continue;
-
-		if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
-			name_len -= XATTR_USER_PREFIX_LEN;
-		
-		pr_err("2 %s, len %d\n", name, name_len);
-
-		ptr = eainfo->name + name_len + 1;
-		buf_free_len -= (offsetof(struct smb2_ea_info, name) +
-				name_len + 1);
-		/* bailout if xattr can't fit in buf_free_len */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-		value_len = ksmbd_vfs_getxattr(idmap, path->dentry,
-#else
-		value_len = ksmbd_vfs_getxattr(user_ns, path->dentry,
-#endif
-					       name, &buf);
-		if (value_len <= 0) {
-			rc = -ENOENT;
-		pr_err("%s:%d\n", __func__, __LINE__);
-			rsp->hdr.Status = STATUS_INVALID_HANDLE;
+		if (rsp_data_cnt)
+			prev_ea_info = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
+	} else {
+		next_offset = smb2_fill_ea_rsp(idmap, xattr_list,
+				xattr_list_len, ptr,
+				&rsp_data_cnt, &buf_free_len, NULL, 0,
+				le32_to_cpu(req->Flags));
+		if (next_offset < 0)
 			goto out;
-		}
-
-		buf_free_len -= value_len;
-		if (buf_free_len < 0) {
-			kfree(buf);
-		pr_err("%s:%d\n", __func__, __LINE__);
-			break;
-		}
-
-		memcpy(ptr, buf, value_len);
-		kfree(buf);
-
-		ptr += value_len;
-		eainfo->Flags = 0;
-		eainfo->EaNameLength = name_len;
-
-		if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
-			memcpy(eainfo->name, &name[XATTR_USER_PREFIX_LEN],
-			       name_len);
-		else
-			memcpy(eainfo->name, name, name_len);
-
-		eainfo->name[name_len] = '\0';
-		eainfo->EaValueLength = cpu_to_le16(value_len);
-		next_offset = ALIGN(offsetof(struct smb2_ea_info, name) +
-			name_len + 1 + value_len, 4);
-
-		/* align next xattr entry at 4 byte bundary */
-		alignment_bytes = ((next_offset + 3) & ~3) - next_offset;
-		if (alignment_bytes) {
-			memset(ptr, '\0', alignment_bytes);
-			ptr += alignment_bytes;
-			next_offset += alignment_bytes;
-			buf_free_len -= alignment_bytes;
-		}
-		eainfo->NextEntryOffset = cpu_to_le32(next_offset);
-		prev_eainfo = eainfo;
-		eainfo = (struct smb2_ea_info *)((char *)eainfo + next_offset);
-		rsp_data_cnt += next_offset;
-
-		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY) {
-			ksmbd_debug(SMB, "single entry requested\n");
-			break;
-		}
+		if (rsp_data_cnt)
+			prev_ea_info = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
 	}
-
+	
 	/* no more ea entries */
 	prev_eainfo->NextEntryOffset = 0;
+
 done:
 	rc = 0;
 	if (rsp_data_cnt == 0) {
@@ -9195,7 +9235,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 #endif
 
 			kfree(symname);
-
+#if 0
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 			ret = ksmbd_vfs_setxattr(file_mnt_idmap(fp->filp), &fp->filp->f_path,
 #else
@@ -9235,7 +9275,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 					sizeof(long long), 0, true);
 			if (ret < 0)
 				pr_err("Failed to store XATTR reparse point : %d\n", ret);
-
+#endif
 			ksmbd_fd_put(work, fp);
 			if (ret)
 				goto out;
