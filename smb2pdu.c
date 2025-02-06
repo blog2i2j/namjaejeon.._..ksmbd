@@ -4931,15 +4931,21 @@ static int smb2_get_info_file_pipe(struct ksmbd_session *sess,
 	return rc;
 }
 
-static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
+static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 		int xattr_list_len, char *ptr, ssize_t *rsp_data_cnt,
 		ssize_t *buf_free_len, u8 *ea_name, unsigned int ea_name_len,
 		unsigned int req_flags)
 {
 	struct smb2_ea_info *eainfo, *prev_eainfo;
-	char *name, *xattr_list = NULL, *buf;
+	char *name, *buf;
 	int rc, name_len, value_len, idx = 0;
 	ssize_t alignment_bytes, next_offset = 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	struct mnt_idmap *idmap = file_mnt_idmap(fp->filp);
+#else
+	struct user_namespace *user_ns = file_mnt_user_ns(fp->filp);
+#endif
+	const struct path *path = &fp->filp->f_path;
 
 	eainfo = (struct smb2_ea_info *)ptr;
 	prev_eainfo = eainfo;
@@ -4964,7 +4970,7 @@ static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
 			continue;
 
 		if (ea_name_len) {
-			pr_err("ea_req name : %s\n", ea_req->name);
+			pr_err("ea name : %s\n", ea_name);
 			if (strncmp(&name[XATTR_USER_PREFIX_LEN], ea_name,
 				     ea_name_len))
 				continue;
@@ -4980,7 +4986,7 @@ static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
 		pr_err("2 %s, len %d\n", name, name_len);
 
 		ptr = eainfo->name + name_len + 1;
-		buf_free_len -= (offsetof(struct smb2_ea_info, name) +
+		*buf_free_len -= (offsetof(struct smb2_ea_info, name) +
 				name_len + 1);
 		/* bailout if xattr can't fit in buf_free_len */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
@@ -4991,14 +4997,12 @@ static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
 					       name, &buf);
 		if (value_len < 0) {
 			rc = -ENOENT;
-		pr_err("%s:%d\n", __func__, __LINE__);
-			rsp->hdr.Status = STATUS_INVALID_HANDLE;
 			goto out;
 		}
 
 		if (value_len > 0) {
-			buf_free_len -= value_len;
-			if (buf_free_len < 0) {
+			*buf_free_len -= value_len;
+			if (*buf_free_len < 0) {
 				kfree(buf);
 				pr_err("%s:%d\n", __func__, __LINE__);
 				break;
@@ -5028,13 +5032,13 @@ static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
 		if (alignment_bytes) {
 			memset(ptr, '\0', alignment_bytes);
 			next_offset += alignment_bytes;
-			buf_free_len -= alignment_bytes;
+			*buf_free_len -= alignment_bytes;
 		}
 
 		eainfo->NextEntryOffset = cpu_to_le32(next_offset);
 		prev_eainfo = eainfo;
 		eainfo = (struct smb2_ea_info *)((char *)eainfo + next_offset);
-		rsp_data_cnt += next_offset;
+		*rsp_data_cnt += next_offset;
 
 		if (req_flags & SL_RETURN_SINGLE_ENTRY) {
 			ksmbd_debug(SMB, "single entry requested\n");
@@ -5042,6 +5046,7 @@ static int smb2_fill_ea_rsp(struct mnt_idmap *idmap, char *xattr_list,
 		}
 	}
 
+	rc = next_offset;
 out:
 	return rc;
 }
@@ -5065,12 +5070,6 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	int rc, name_len, value_len, xattr_list_len, idx;
 	ssize_t buf_free_len, alignment_bytes, next_offset, rsp_data_cnt = 0;
 	struct smb2_ea_info_req *ea_req = NULL;
-	const struct path *path;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-	struct mnt_idmap *idmap = file_mnt_idmap(fp->filp);
-#else
-	struct user_namespace *user_ns = file_mnt_user_ns(fp->filp);
-#endif
 
 	if (!(fp->daccess & FILE_READ_EA_LE)) {
 		pr_err("Not permitted to read ext attr : 0x%x\n",
@@ -5078,20 +5077,8 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		return -EACCES;
 	}
 
-	path = &fp->filp->f_path;
 	/* single EA entry is requested with given user.* name */
-	if (req->InputBufferLength) {
-		if (le32_to_cpu(req->InputBufferLength) <
-		    sizeof(struct smb2_ea_info_req))
-			return -EINVAL;
-
-		ea_req = (struct smb2_ea_info_req *)((char *)req +
-						     le16_to_cpu(req->InputBufferOffset));
-
-		if (le32_to_cpu(req->InputBufferLength) <
-		    sizeof(struct smb2_ea_info_req) + ea_req->EaNameLength)
-			return -EINVAL;
-	} else {
+	if (!req->InputBufferLength) {
 		/* need to send all EAs, if no specific EA is requested*/
 		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY)
 			ksmbd_debug(SMB,
@@ -5099,15 +5086,14 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 				    le32_to_cpu(req->Flags));
 	}
 
-	buf_free_len =
-		smb2_calc_max_out_buf_len(work, 8,
-					  le32_to_cpu(req->OutputBufferLength));
+	buf_free_len = smb2_calc_max_out_buf_len(work, 8,
+			le32_to_cpu(req->OutputBufferLength));
 	if (buf_free_len < 0) {
 		pr_err("%s:%d\n", __func__, __LINE__);
 		return -EINVAL;
 	}
 
-	rc = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
+	rc = ksmbd_vfs_listxattr(fp->filp->f_path.dentry, &xattr_list);
 	if (rc < 0) {
 		rsp->hdr.Status = STATUS_INVALID_HANDLE;
 		pr_err("%s:%d\n", __func__, __LINE__);
@@ -5121,7 +5107,6 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	ptr = (char *)rsp->Buffer;
 
 	if (req->InputBufferLength) {
-		bool found = false;
 		unsigned int input_buf_len = le32_to_cpu(req->InputBufferLength);
 		unsigned int next;
 
@@ -5136,12 +5121,14 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 				break;
 
 			pr_err("ea_req name : %s\n", ea_req->name);
-			next_offset = smb2_fill_ea_rsp(idmap, xattr_list,
+			next_offset = smb2_fill_ea_rsp(fp, xattr_list,
 					xattr_list_len, ptr + rsp_data_cnt,
 					&rsp_data_cnt, &buf_free_len,
 					ea_req->name, ea_req->EaNameLength, 0);
-			if (next_offset < 0)
+			if (next_offset < 0) {
+				rc = next_offset;
 				goto out;
+			}
 
 			next = le32_to_cpu(ea_req->NextEntryOffset);
 			if (next == 0 || input_buf_len < next)
@@ -5156,29 +5143,32 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		} while (input_buf_len > 0);
 
 		if (rsp_data_cnt)
-			prev_ea_info = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
+			prev_eainfo = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
 	} else {
-		next_offset = smb2_fill_ea_rsp(idmap, xattr_list,
-				xattr_list_len, ptr,
-				&rsp_data_cnt, &buf_free_len, NULL, 0,
+		next_offset = smb2_fill_ea_rsp(fp, xattr_list, xattr_list_len,
+				ptr, &rsp_data_cnt, &buf_free_len, NULL, 0,
 				le32_to_cpu(req->Flags));
-		if (next_offset < 0)
+		if (next_offset < 0) {
+			rc = next_offset;
 			goto out;
+		}
 		if (rsp_data_cnt)
-			prev_ea_info = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
+			prev_eainfo = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
 	}
 	
 	/* no more ea entries */
 	prev_eainfo->NextEntryOffset = 0;
 
 done:
-	rc = 0;
-	if (rsp_data_cnt == 0) {
+	if (!rc && rsp_data_cnt == 0) {
 		rsp->hdr.Status = STATUS_NO_EAS_ON_FILE;
 		rc = -EINVAL;
 	}
 	rsp->OutputBufferLength = cpu_to_le32(rsp_data_cnt);
 out:
+	if (rc < 0)
+		rsp->hdr.Status = STATUS_INVALID_HANDLE;
+
 	kvfree(xattr_list);
 	return rc;
 }
