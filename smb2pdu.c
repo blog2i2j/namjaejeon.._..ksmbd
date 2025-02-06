@@ -5120,7 +5120,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		}
 		eainfo->NextEntryOffset = cpu_to_le32(next_offset);
 		prev_eainfo = eainfo;
-		eainfo = (struct smb2_ea_info *)ptr;
+		eainfo = (struct smb2_ea_info *)((char *)eainfo + next_offset);
 		rsp_data_cnt += next_offset;
 
 		if (le32_to_cpu(req->Flags) & SL_RETURN_SINGLE_ENTRY) {
@@ -9141,6 +9141,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 		struct ksmbd_file *fp;
 		int sid = 1000;
 		int mode = 0644;
+		long long dev = 1000;
 
 		pr_err("%s:%d FSCTL_SET_REPARSE_POINT WSL\n", __func__, __LINE__);
 		fp = ksmbd_lookup_fd_fast(work, id);
@@ -9230,8 +9231,8 @@ int smb2_ioctl(struct ksmbd_work *work)
 #else
 			ret = ksmbd_vfs_setxattr(user_ns, path,
 #endif
-					XATTR_NAME_WSL_DEV, &sid,
-					sizeof(int), 0, true);
+					XATTR_NAME_WSL_DEV, &dev,
+					sizeof(long long), 0, true);
 			if (ret < 0)
 				pr_err("Failed to store XATTR reparse point : %d\n", ret);
 
