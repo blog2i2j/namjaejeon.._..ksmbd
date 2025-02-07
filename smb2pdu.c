@@ -4954,7 +4954,7 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 		name = xattr_list + idx;
 		name_len = strlen(name);
 
-		pr_err("%s, len %d\n", name, name_len);
+		pr_err("%s, len %d, ea_name : %s, ea_len : %u\n", name, name_len, ea_name, ea_name_len);
 		idx += name_len + 1;
 
 		/*
@@ -4970,7 +4970,7 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 			continue;
 
 		if (ea_name_len) {
-			pr_err("ea name : %s\n", ea_name);
+//			pr_err("ea name : %s\n", ea_name);
 			if (strncmp(&name[XATTR_USER_PREFIX_LEN], ea_name,
 				     ea_name_len))
 				continue;
@@ -5035,11 +5035,21 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 		}
 	}
 
+	pr_err("next_offset : %u, buf_free_len : %d, rsp_data_cnt : %d\n", next_offset, buf_free_len, rsp_data_cnt);
 	/* Fill EA request name with empty value */
-	if (ea_name_len && next_offset) {
+	if (ea_name_len && next_offset == 0) {
+		next_offset = ALIGN(offsetof(struct smb2_ea_info, name) +
+				ea_name_len + 1, 4);
+		if (*buf_free_len - next_offset < 0) {
+			next_offset = 0;
+			goto out;
+		}
+
+		pr_err("fill empty ea name : %s\n", ea_name);
 		eainfo->EaNameLength = ea_name_len;
 		memcpy(eainfo->name, ea_name, ea_name_len);
 		eainfo->name[ea_name_len] = '\0';
+		eainfo->EaValueLength = 0;
 
 		next_offset = ALIGN(offsetof(struct smb2_ea_info, name) +
 				ea_name_len + 1, 4);
@@ -5070,7 +5080,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	struct smb2_ea_info *eainfo, *prev_eainfo;
 	char *name, *ptr, *xattr_list = NULL, *buf;
 	int rc, name_len, value_len, xattr_list_len, idx;
-	ssize_t buf_free_len, alignment_bytes, next_offset, rsp_data_cnt = 0;
+	ssize_t buf_free_len, alignment_bytes, next_offset = 0, rsp_data_cnt = 0;
 	struct smb2_ea_info_req *ea_req = NULL;
 
 	if (!(fp->daccess & FILE_READ_EA_LE)) {
@@ -5105,9 +5115,11 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		goto done;
 	}
 	xattr_list_len = rc;
+	rc = 0;
 
 	ptr = (char *)rsp->Buffer;
 
+	pr_err("%s:%d\n", __func__, __LINE__);
 	if (req->InputBufferLength) {
 		unsigned int input_buf_len = le32_to_cpu(req->InputBufferLength);
 		unsigned int next;
@@ -5159,6 +5171,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 //		prev_eainfo->NextEntryOffset = 0;
 	}
 
+	pr_err("%s:%d\n", __func__, __LINE__);
 done:
 	if (!rc && rsp_data_cnt == 0) {
 		rsp->hdr.Status = STATUS_NO_EAS_ON_FILE;
@@ -5166,6 +5179,7 @@ done:
 	}
 	rsp->OutputBufferLength = cpu_to_le32(rsp_data_cnt);
 out:
+	pr_err("%s:%d, rc : %d, rsp_data_cnt : %u\n", __func__, __LINE__, rc, rsp_data_cnt);
 	if (rc < 0)
 		rsp->hdr.Status = STATUS_INVALID_HANDLE;
 
