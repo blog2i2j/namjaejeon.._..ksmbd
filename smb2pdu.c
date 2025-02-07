@@ -9318,8 +9318,13 @@ int smb2_ioctl(struct ksmbd_work *work)
 			ksmbd_fd_put(work, fp);
 		} else {
 			ksmbd_fd_put(work, fp);
-			ret = -ENOENT;
-			goto out;
+			if (reparse_ptr->ReparseTag != IO_REPARSE_TAG_LX_CHR_LE &&
+			    reparse_ptr->ReparseTag != IO_REPARSE_TAG_LX_BLK_LE &&
+			    reparse_ptr->ReparseTag != IO_REPARSE_TAG_LX_FIFO_LE &&
+			    reparse_ptr->ReparseTag != IO_REPARSE_TAG_AF_UNIX_LE) {
+				ret = -ENOENT;
+				goto out;
+			}
 		}
 
 		break;
