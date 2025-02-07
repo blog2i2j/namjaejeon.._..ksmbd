@@ -4938,7 +4938,7 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 {
 	struct smb2_ea_info *eainfo, *prev_eainfo;
 	char *name, *buf;
-	int rc, name_len, value_len, idx = 0;
+	int name_len, value_len, idx = 0;
 	ssize_t alignment_bytes, next_offset = 0;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 	struct mnt_idmap *idmap = file_mnt_idmap(fp->filp);
@@ -4947,7 +4947,7 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 #endif
 	const struct path *path = &fp->filp->f_path;
 
-	eainfo = (struct smb2_ea_info *)ptr;
+	eainfo = (struct smb2_ea_info *)ptr + *rsp_data_cnt;
 	prev_eainfo = eainfo;
 
 	while (idx < xattr_list_len) {
@@ -4986,8 +4986,6 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 		pr_err("2 %s, len %d\n", name, name_len);
 
 		ptr = eainfo->name + name_len + 1;
-		*buf_free_len -= (offsetof(struct smb2_ea_info, name) +
-				name_len + 1);
 		/* bailout if xattr can't fit in buf_free_len */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 		value_len = ksmbd_vfs_getxattr(idmap, path->dentry,
@@ -4995,19 +4993,15 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 		value_len = ksmbd_vfs_getxattr(user_ns, path->dentry,
 #endif
 					       name, &buf);
-		if (value_len < 0) {
-			rc = -ENOENT;
-			goto out;
-		}
+		if (value_len < 0)
+			return -ENOENT;
 
 		if (value_len > 0) {
-			*buf_free_len -= value_len;
-			if (*buf_free_len < 0) {
+			if (*buf_free_len - value_len < 0) {
 				kfree(buf);
 				pr_err("%s:%d\n", __func__, __LINE__);
 				break;
 			}
-
 			memcpy(ptr, buf, value_len);
 		}
 		kfree(buf);
@@ -5018,22 +5012,17 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 
 		if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN))
 			memcpy(eainfo->name, &name[XATTR_USER_PREFIX_LEN],
-			       name_len);
+					name_len);
 		else
 			memcpy(eainfo->name, name, name_len);
 
 		eainfo->name[name_len] = '\0';
 		eainfo->EaValueLength = cpu_to_le16(value_len);
-		next_offset = offsetof(struct smb2_ea_info, name) +
-			name_len + 1 + value_len;
 
 		/* align next xattr entry at 4 byte bundary */
-		alignment_bytes = ((next_offset + 3) & ~3) - next_offset;
-		if (alignment_bytes) {
-			memset(ptr, '\0', alignment_bytes);
-			next_offset += alignment_bytes;
-			*buf_free_len -= alignment_bytes;
-		}
+		next_offset = ALIGN(offsetof(struct smb2_ea_info, name) +
+				name_len + 1 + value_len, 4);
+		*buf_free_len -= next_offset;
 
 		eainfo->NextEntryOffset = cpu_to_le32(next_offset);
 		prev_eainfo = eainfo;
@@ -5046,9 +5035,22 @@ static int smb2_fill_ea_rsp(struct ksmbd_file *fp, char *xattr_list,
 		}
 	}
 
-	rc = next_offset;
+	/* Fill EA request name with empty value */
+	if (ea_name_len && next_offset) {
+		eainfo->EaNameLength = ea_name_len;
+		memcpy(eainfo->name, ea_name, ea_name_len);
+		eainfo->name[ea_name_len] = '\0';
+
+		next_offset = ALIGN(offsetof(struct smb2_ea_info, name) +
+				ea_name_len + 1, 4);
+		eainfo->NextEntryOffset = cpu_to_le32(next_offset);
+
+		*buf_free_len -= next_offset;
+		*rsp_data_cnt += next_offset;
+	}
+
 out:
-	return rc;
+	return next_offset;
 }
 
 /**
@@ -5122,7 +5124,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 
 			pr_err("ea_req name : %s\n", ea_req->name);
 			next_offset = smb2_fill_ea_rsp(fp, xattr_list,
-					xattr_list_len, ptr + rsp_data_cnt,
+					xattr_list_len, ptr,
 					&rsp_data_cnt, &buf_free_len,
 					ea_req->name, ea_req->EaNameLength, 0);
 			if (next_offset < 0) {
@@ -5141,9 +5143,6 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 				break;
 			}
 		} while (input_buf_len > 0);
-
-		if (rsp_data_cnt)
-			prev_eainfo = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
 	} else {
 		next_offset = smb2_fill_ea_rsp(fp, xattr_list, xattr_list_len,
 				ptr, &rsp_data_cnt, &buf_free_len, NULL, 0,
@@ -5152,12 +5151,13 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 			rc = next_offset;
 			goto out;
 		}
-		if (rsp_data_cnt)
-			prev_eainfo = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
 	}
-	
-	/* no more ea entries */
-	prev_eainfo->NextEntryOffset = 0;
+
+	if (rsp_data_cnt) {
+//		prev_eainfo = (struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset);
+		((struct smb2_ea_info *)(ptr + rsp_data_cnt - next_offset))->NextEntryOffset = 0;
+//		prev_eainfo->NextEntryOffset = 0;
+	}
 
 done:
 	if (!rc && rsp_data_cnt == 0) {
