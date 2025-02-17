@@ -899,14 +899,12 @@ out:
 
 static int parse_sid(struct smb_sid *psid, char *end_of_acl)
 {
-	/*
-	 * validate that we do not go past end of ACL - sid must be at least 8
-	 * bytes long (assuming no sub-auths - e.g. the null SID
-	 */
-	if (end_of_acl < (char *)psid + 8) {
-		pr_err("ACL too small to parse SID %p\n", psid);
+	char *acl_base = (char *)psid;
+
+	if (psid->num_subauth > SID_MAX_SUB_AUTHORITIES ||
+            (end_of_acl - acl_base <
+	     offsetof(struct smb_sid, sub_auth) + sizeof(__le32) * psid->num_subauth))
 		return -EINVAL;
-	}
 
 	return 0;
 }
@@ -943,6 +941,11 @@ int parse_sec_desc(struct user_namespace *user_ns, struct smb_ntsd *pntsd,
 		    pntsd->revision, pntsd->type, le32_to_cpu(pntsd->osidoffset),
 		    le32_to_cpu(pntsd->gsidoffset),
 		    le32_to_cpu(pntsd->sacloffset), dacloffset);
+
+	if (le32_to_cpu(pntsd->osidoffset) < sizeof(struct smb_ntsd) ||
+	    le32_to_cpu(pntsd->gsidoffset) < sizeof(struct smb_ntsd) ||
+	     dacloffset < sizeof(struct smb_ntsd))
+		return -EINVAL;
 
 	pntsd_type = le16_to_cpu(pntsd->type);
 	if (!(pntsd_type & DACL_PRESENT)) {
