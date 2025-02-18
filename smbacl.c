@@ -899,11 +899,20 @@ out:
 
 static int parse_sid(struct smb_sid *psid, char *end_of_acl)
 {
-	char *acl_base = (char *)psid;
+	/*
+	 * validate that we do not go past end of ACL - sid must be at least 8
+	 * bytes long (assuming no sub-auths - e.g. the null SID
+	 */
+	if (end_of_acl < (char *)psid + 8) {
+		pr_err("ACL too small to parse SID %p\n", psid);
+		return -EINVAL;
+	}
+
+	if (!psid->num_subauth)
+		return 0;
 
 	if (psid->num_subauth > SID_MAX_SUB_AUTHORITIES ||
-            (end_of_acl - acl_base <
-	     offsetof(struct smb_sid, sub_auth) + sizeof(__le32) * psid->num_subauth))
+	    end_of_acl < (char *)psid + 8 + sizeof(__le32) * psid->num_subauth)
 		return -EINVAL;
 
 	return 0;
